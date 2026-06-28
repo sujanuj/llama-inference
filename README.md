@@ -70,11 +70,42 @@ inference systems instead.
       directly (a strongly negative gate suppresses a large up-projection
       value, rather than just checking shapes)
 
+**Phase 3: Full forward pass — done**
+
+- [x] `model/weights.py` — plain dataclasses (`AttentionWeights`,
+      `MLPWeights`, `DecoderLayerWeights`, `ModelWeights`) holding the
+      model's parameters by name, with no `nn.Module`/`nn.Parameter`
+      anywhere — these exist purely to give real weight-loading (next
+      phase) a clean, typed place to populate fields into
+- [x] **Tied embeddings handled explicitly**: Llama-3.2-1B and -3B share
+      the input embedding matrix and the output projection (no separate
+      `lm_head.weight` exists in the real checkpoint for these sizes) —
+      `ModelWeights.output_projection()` falls back to the transposed
+      embedding table when `lm_head_weight` is `None`, verified against
+      both the tied and untied cases directly
+- [x] `model/decoder.py` — the pre-norm residual block (norm -> attention
+      -> residual -> norm -> MLP -> residual) that gets stacked 16 times
+- [x] `model/model.py` — the full forward pass: token embedding lookup,
+      16 stacked decoder layers, final RMSNorm, output projection to
+      vocabulary logits, plus greedy next-token selection
+- [x] `testutil/random_weights.py` — builds a full `ModelWeights`
+      instance with random tensors of the CORRECT shapes for any config,
+      so the complete architecture can be exercised end-to-end without
+      needing real downloaded weights — legitimate for testing shape/flow
+      correctness, since that doesn't depend on which numbers are loaded
+- [x] **Causal masking verified at the assembled-model level, not just per
+      attention call**: changing only the last token in an input sequence
+      and confirming every earlier position's logits are byte-for-byte
+      unchanged, after going through embedding + 3 stacked decoder layers
+      + output projection — this is the test that would catch a future-
+      information leak introduced by residual wiring or layer-stacking,
+      which a single isolated attention test could never exercise
+- [x] Determinism check (same weights + same input -> identical output)
+      and a smaller-config run to confirm no hidden dependency on
+      Llama-3.2-1B's specific dimensions
+
 **Planned:**
 
-- [ ] Full transformer block (norm -> attention -> residual -> norm ->
-      MLP -> residual) and embedding/output layers — the first complete,
-      runnable forward pass
 - [ ] Real weight loading from `meta-llama/Llama-3.2-1B` and a numerical
       cross-check against the reference HuggingFace implementation
 - [ ] Naive (unbounded) KV-cache, measured, then a paged KV-cache (fixed-
@@ -126,13 +157,41 @@ and produces wrong numbers is a much worse failure mode than a crash,
 because nothing announces it; the testing strategy here is built around
 that specifically.
 
+## Why tied embeddings need explicit handling
+
+Llama-3.2-1B and -3B share the input embedding matrix and the output
+projection -- there's no separate `lm_head.weight` tensor in the real
+checkpoint for these model sizes. A from-scratch implementation that
+assumes every model has its own independent output projection would
+either fail to load these checkpoints at all or, worse, silently
+allocate a randomly-initialized output head that doesn't match the
+embeddings it's supposed to be tied to. `ModelWeights.output_projection()`
+handles this directly: it returns the transposed embedding table unless
+an explicit `lm_head_weight` is present, which is exactly the condition
+real Llama-3.2-1B/3B checkpoints are in (larger Llama variants, 8B+, do
+NOT tie embeddings and would populate this field instead).
+
+## Why causal masking gets tested twice -- once per attention call, once across the whole stack
+
+`test_attention.py` (Phase 2) verifies a single attention call respects
+causality. `test_model.py` (Phase 3) verifies the SAME property holds
+after going through token embedding, several stacked decoder layers, and
+the output projection -- by changing only the last token in an input
+sequence and confirming every earlier position's logits come back
+byte-for-byte identical. These are genuinely different tests: a bug in
+how residual connections or layer-stacking are wired could in principle
+leak future-token information even if every individual attention call,
+tested in isolation, is perfectly causal. Testing the same property at
+both the unit level and the assembled-system level is deliberate, not
+redundant.
+
 ## Running tests
 
 ```bash
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-python -m pytest tests/ -v   # 23 tests as of Phase 2
+python -m pytest tests/ -v   # 31 tests as of Phase 3
 ```
 
 ## Project layout
@@ -144,7 +203,12 @@ llama-inference/
 │   ├── rmsnorm.py       <- RMSNorm (Phase 1)
 │   ├── rope.py          <- Rotary position embeddings (Phase 1)
 │   ├── attention.py     <- Grouped-query attention (Phase 2)
-│   └── mlp.py           <- SwiGLU MLP (Phase 2)
+│   ├── mlp.py           <- SwiGLU MLP (Phase 2)
+│   ├── weights.py       <- Weight dataclasses, tied-embeddings logic (Phase 3)
+│   ├── decoder.py        <- Pre-norm residual decoder layer (Phase 3)
+│   └── model.py          <- Full forward pass + greedy decoding (Phase 3)
+├── testutil/
+│   └── random_weights.py  <- Random-but-correctly-shaped weights for testing (Phase 3)
 ├── tests/               <- one test file per model/ module, same names
 ├── kvcache/             <- (next) paged KV-cache
 ├── scheduler/           <- (next) continuous-batching scheduler
