@@ -104,10 +104,43 @@ inference systems instead.
       and a smaller-config run to confirm no hidden dependency on
       Llama-3.2-1B's specific dimensions
 
+**Phase 4: Real checkpoint loading — done**
+
+- [x] `model/load_weights.py` -- loads a real Llama-3.2-1B checkpoint
+      (HuggingFace safetensors format) into this project's
+      `ModelWeights`/`DecoderLayerWeights` dataclasses
+- [x] **Every 2-D projection transposed explicitly, on load.** HuggingFace
+      stores `nn.Linear` weights as `(out_features, in_features)` and
+      computes `y = x @ W.T`; this project's forward-pass code computes
+      `y = x @ W` directly. Every attention and MLP projection needs an
+      explicit `.T` on load, or the result either fails loudly (a
+      non-square shape mismatch) or, worse, silently multiplies with
+      backwards semantics for any matrix that happens to be square.
+      Tested directly: a synthetic checkpoint stores weights in the real
+      HF `(out, in)` convention, and the test confirms every loaded
+      weight comes out in this project's `(in, out)` convention.
+- [x] **Config loaded from the checkpoint's own `config.json`, not
+      trusted blindly from `model/config.py`** -- `verify_config_matches`
+      raises a clear, specific error (naming exactly which field and what
+      the mismatch is) if the checkpoint disagrees with this project's
+      architectural assumptions, rather than letting a mismatch surface
+      later as a confusing shape error deep inside a matmul
+- [x] Tied-embeddings detection re-verified on the LOADED path (not just
+      Phase 3's random-weight path): a synthetic checkpoint built without
+      an `lm_head.weight` tensor (matching real Llama-3.2-1B/3B) correctly
+      falls back to the transposed embedding table; one built WITH a
+      separate `lm_head.weight` correctly uses it instead
+- [x] End-to-end: a synthetic checkpoint loaded through the real loader,
+      run through the real `forward()` from Phase 3 -- not just shape
+      assertions on the loaded dataclass in isolation
+- [x] `scripts/verify_against_huggingface.py` -- downloads the real
+      checkpoint, runs the same input through both this project's forward
+      pass and HuggingFace's reference `LlamaForCausalLM`, and compares
+      logits numerically (max/mean absolute difference) against a stated,
+      justified tolerance, plus a practical greedy-next-token match check
+
 **Planned:**
 
-- [ ] Real weight loading from `meta-llama/Llama-3.2-1B` and a numerical
-      cross-check against the reference HuggingFace implementation
 - [ ] Naive (unbounded) KV-cache, measured, then a paged KV-cache (fixed-
       size blocks, like OS virtual memory pages), with the memory
       reduction measured directly
@@ -185,13 +218,45 @@ tested in isolation, is perfectly causal. Testing the same property at
 both the unit level and the assembled-system level is deliberate, not
 redundant.
 
+## Why every weight gets transposed on load
+
+HuggingFace's `nn.Linear` stores its weight as `(out_features,
+in_features)` and computes `y = x @ W.T + b`. This project's forward-pass
+code (Phases 1-3) computes `y = x @ W` directly, with no transpose, by
+design -- it keeps the raw tensor math in `model/attention.py` and
+`model/mlp.py` readable without a `.T` scattered through every call site.
+The consequence: every single projection loaded from a real checkpoint
+needs an explicit transpose before it goes into this project's
+dataclasses. `model/load_weights.py` does this per-tensor, with a comment
+at each transpose, rather than relying on one shared
+get-it-right-once helper -- specifically so a future edit to how one
+weight loads can't accidentally skip the transpose for another. Tested
+directly with a synthetic checkpoint that stores weights in the real
+`(out, in)` convention and confirms every loaded weight comes out
+transposed correctly.
+
+## Verifying against real weights
+
+`scripts/verify_against_huggingface.py` is the actual point where
+"architecturally correct" gets checked against "numerically identical to
+the real thing." It downloads real `meta-llama/Llama-3.2-1B` weights,
+runs the same input through this project's forward pass AND
+HuggingFace's reference `LlamaForCausalLM`, and reports the max/mean
+absolute difference between the two logit tensors against a stated
+tolerance (1e-3 -- tight enough to catch a real bug like a wrong RoPE
+convention or a missed transpose, loose enough to tolerate harmless
+floating-point accumulation-order differences between two different
+matmul call patterns computing the same math). This can't run in this
+sandbox (no path to huggingface.co); see the script's docstring for
+exact setup steps to run it on a machine with Hub access.
+
 ## Running tests
 
 ```bash
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-python -m pytest tests/ -v   # 31 tests as of Phase 3
+python -m pytest tests/ -v   # 40 tests as of Phase 4
 ```
 
 ## Project layout
@@ -206,9 +271,12 @@ llama-inference/
 │   ├── mlp.py           <- SwiGLU MLP (Phase 2)
 │   ├── weights.py       <- Weight dataclasses, tied-embeddings logic (Phase 3)
 │   ├── decoder.py        <- Pre-norm residual decoder layer (Phase 3)
-│   └── model.py          <- Full forward pass + greedy decoding (Phase 3)
+│   ├── model.py          <- Full forward pass + greedy decoding (Phase 3)
+│   └── load_weights.py    <- Real checkpoint loader, HF format (Phase 4)
 ├── testutil/
 │   └── random_weights.py  <- Random-but-correctly-shaped weights for testing (Phase 3)
+├── scripts/
+│   └── verify_against_huggingface.py  <- Real-weight numerical cross-check (Phase 4, run on a machine with Hub access)
 ├── tests/               <- one test file per model/ module, same names
 ├── kvcache/             <- (next) paged KV-cache
 ├── scheduler/           <- (next) continuous-batching scheduler
