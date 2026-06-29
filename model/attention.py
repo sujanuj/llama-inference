@@ -66,8 +66,9 @@ def scaled_dot_product_attention(
         causal: if True, mask out attention to future positions.
 
     Returns:
-        (batch, num_heads, q_len, head_dim)
+        (batch, num_heads, q_len, head_dim) — same dtype as the inputs.
     """
+    input_dtype = query.dtype
     head_dim = query.shape[-1]
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(head_dim)
     # scores: (batch, num_heads, q_len, kv_len)
@@ -85,7 +86,24 @@ def scaled_dot_product_attention(
         mask = col_positions > row_positions  # True where attention should be blocked
         scores = scores.masked_fill(mask, float("-inf"))
 
-    weights = torch.softmax(scores, dim=-1)
+    # Softmax computed in float32 regardless of the input's dtype, then
+    # cast back before the final matmul with value. This matters for two
+    # real reasons, not just style:
+    #   1. Numerical stability — softmax involves exponentials, and bf16
+    #      has very few mantissa bits, so accumulating a sum of
+    #      exponentials in bf16 loses real precision. Real Llama
+    #      checkpoints (loaded as bf16, see model/load_weights.py) are
+    #      trained with reference implementations that do this same
+    #      upcast for exactly this reason.
+    #   2. A real, observed bug: without an explicit, consistent dtype
+    #      discipline here, torch's type-promotion rules for masked_fill
+    #      + softmax on a bf16 tensor produced a torch.matmul dtype
+    #      mismatch (float32 weights vs. bf16 value) when this was first
+    #      run against the real Llama-3.2-1B bf16 checkpoint — caught
+    #      immediately as a loud RuntimeError, not a silent wrong
+    #      number, which is the failure mode this project's testing
+    #      philosophy is built around catching either way.
+    weights = torch.softmax(scores.to(torch.float32), dim=-1).to(input_dtype)
     return torch.matmul(weights, value)
 
 

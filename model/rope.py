@@ -89,8 +89,25 @@ def apply_rope(
             actual sequence length and broadcastable against it.
 
     Returns:
-        Same shape as x, rotated.
+        Same shape AND dtype as x.
     """
+    # compute_rope_frequencies always returns cos/sin in float32 (see
+    # that function's docstring) for the same numerical-stability reason
+    # RMSNorm and the attention softmax upcast internally. But x itself
+    # may be bf16 (real Llama-3.2-1B checkpoints are stored in bf16 —
+    # see model/load_weights.py). Without casting cos/sin to x's dtype
+    # FIRST, `x * cos` would silently upcast to float32 via torch's type
+    # promotion rules, and the rotated result would end up float32 even
+    # though x came in as bf16 — not an error, just a quiet dtype change
+    # that could cause a mismatch further down the pipeline (exactly the
+    # class of bug that surfaced as a real RuntimeError in
+    # scaled_dot_product_attention when this was first run against the
+    # actual bf16 checkpoint). Casting explicitly here keeps the
+    # function's contract ("same dtype as x") true regardless of x's
+    # actual dtype.
+    cos = cos.to(x.dtype)
+    sin = sin.to(x.dtype)
+
     # Standard 2D rotation formula applied per frequency pair:
     #   rotated = x * cos + rotate_half(x) * sin
     # This is algebraically the rotation matrix
