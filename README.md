@@ -147,11 +147,45 @@ inference systems instead.
       the debugging process is at least as informative as the final
       green checkmark
 
+**Phase 5, part 1: Naive KV-cache -- done**
+
+- [x] `kvcache/naive_cache.py` -- per-layer K/V storage that grows via
+      concatenation on every append, cached at the KV-HEAD dimension
+      (not the query-head dimension) specifically because that's where
+      GQA's real memory savings live: 8 KV heads cached instead of 32
+      query heads is already a 4x reduction before any further
+      optimization
+- [x] `model/attention.py`'s `attention_with_cache` and
+      `model/decoder.py`'s `decoder_layer_with_cache` reuse the EXACT
+      same `scaled_dot_product_attention` and `repeat_kv` primitives as
+      the no-cache path -- no second implementation of attention math
+      that could silently drift out of sync with the original
+- [x] **The single most important correctness property, verified
+      directly**: token-by-token cached generation produces logits and
+      next-token predictions IDENTICAL to running the full resulting
+      sequence through the no-cache `forward()` in one shot, checked at
+      every position across two separate test scenarios (a 4-token
+      prompt with 5 generated tokens, and an 8-token prompt with 10
+      generated tokens, specifically to exercise `position_offset`
+      advancing well past the prompt length, not just the first step)
+- [x] `model/model.py`'s `generate()` ties prefill (the whole prompt
+      processed in one `forward_with_cache` call at `position_offset=0`)
+      and decode (one new token per step, `position_offset` advancing
+      by 1 each time) into a single, usable generation loop
+- [x] Real memory baseline measured at actual Llama-3.2-1B dimensions
+      (`benchmark/measure_naive_cache_memory.py`, no real weights
+      needed -- memory footprint depends only on tensor shapes and
+      dtype): **128MB at a 4096-token sequence, batch size 1; 2GB at
+      the same sequence length, batch size 16** -- confirmed exactly
+      linear in both sequence length and batch size, which is precisely
+      the real cost a paged cache exists to reduce, and the actual
+      baseline the next phase's measured savings will be compared against
+
 **Planned:**
 
-- [ ] Naive (unbounded) KV-cache, measured, then a paged KV-cache (fixed-
-      size blocks, like OS virtual memory pages), with the memory
-      reduction measured directly
+- [ ] Paged KV-cache (fixed-size blocks, like OS virtual memory pages),
+      with the memory reduction measured directly against the naive
+      baseline above
 - [ ] Continuous-batching scheduler for multiple concurrent requests of
       different lengths
 - [ ] INT8/INT4 quantization, measured for perplexity degradation vs.
@@ -328,7 +362,8 @@ differences in the tens-to-hundreds range, not hundredths.
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-python -m pytest tests/ -v   # 45 tests as of Phase 4
+python -m pytest tests/ -v   # 54 tests as of Phase 5 part 1
+python benchmark/measure_naive_cache_memory.py  # real KV-cache memory measurements
 ```
 
 ## Project layout
@@ -347,6 +382,10 @@ llama-inference/
 │   └── load_weights.py    <- Real checkpoint loader, HF format (Phase 4)
 ├── testutil/
 │   └── random_weights.py  <- Random-but-correctly-shaped weights for testing (Phase 3)
+├── kvcache/
+│   └── naive_cache.py                    <- Naive per-request KV-cache (Phase 5 part 1)
+├── benchmark/
+│   └── measure_naive_cache_memory.py     <- Real memory baseline at Llama-3.2-1B dimensions
 ├── scripts/
 │   ├── verify_against_huggingface.py     <- Real-weight numerical cross-check (Phase 4, run on a machine with Hub access)
 │   └── diagnose_layer_divergence.py      <- Layer-by-layer divergence localization, used to debug the verification above
