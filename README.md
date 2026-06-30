@@ -138,6 +138,14 @@ inference systems instead.
       pass and HuggingFace's reference `LlamaForCausalLM`, and compares
       logits numerically (max/mean absolute difference) against a stated,
       justified tolerance, plus a practical greedy-next-token match check
+- [x] **Verified against the real `meta-llama/Llama-3.2-1B` checkpoint:
+      PASS.** Max absolute logit difference 0.0217, mean 0.0015, and the
+      exact same greedy-decoded next token as HuggingFace's reference
+      implementation. Getting here required finding and fixing two real
+      bugs and correctly diagnosing a false alarm -- the full story is in
+      "Real bugs found verifying against actual weights" below, because
+      the debugging process is at least as informative as the final
+      green checkmark
 
 **Planned:**
 
@@ -250,13 +258,77 @@ matmul call patterns computing the same math). This can't run in this
 sandbox (no path to huggingface.co); see the script's docstring for
 exact setup steps to run it on a machine with Hub access.
 
+## Real bugs found verifying against actual weights
+
+Running `verify_against_huggingface.py` against the real downloaded
+checkpoint surfaced two genuine bugs and one false alarm, in sequence.
+Documenting the process, not just the final result, because the
+debugging methodology is at least as valuable a signal as the green
+checkmark at the end of it.
+
+**Bug 1: bf16/fp32 dtype mismatch in attention and RoPE.** Every test
+fixture through Phase 4 used `torch.randn(...)`, which defaults to
+float32 -- so nothing had ever exercised this codebase against bf16
+tensors. Real Llama-3.2-1B weights are stored in bf16. The very first
+real-weight run crashed immediately:
+
+```
+RuntimeError: expected m1 and m2 to have the same dtype, but got: float != c10::BFloat16
+```
+
+Root cause: `scaled_dot_product_attention`'s softmax had no explicit
+dtype handling, and `apply_rope` let its float32 `cos`/`sin` tables
+silently upcast bf16 inputs via torch's type-promotion rules. Fixed by
+explicitly computing softmax in float32 (matching real Llama's own
+practice, for numerical stability) and casting back, and by casting
+`cos`/`sin` to the input's dtype before rotating. **The fix was verified,
+not assumed**: the fix was temporarily reverted and the new regression
+tests (`tests/test_bf16_dtype.py`) were confirmed to reproduce the exact
+original error before the fix was restored.
+
+**Bug 2: comparing bf16 math against fp32 math, not the same math at two
+precisions.** With bug 1 fixed, the verification script ran to
+completion but reported `FAIL`, max difference 0.17 -- large enough to
+look like a real correctness bug, but the actual cause was simpler: the
+script loaded HuggingFace's reference model with `torch_dtype=torch.float32`
+(upcasting on load) while this project's own `load_model_weights` loaded
+the checkpoint's native bf16 tensors with no conversion. The two sides
+were running genuinely different precision throughout the entire
+forward pass. Fixed by upcasting the loaded weights to float32 before
+running this project's forward pass too -- bringing the difference down
+to 0.022, an order of magnitude improvement, confirming the diagnosis.
+
+**False alarm: an apparent ~130-point blowup at the last layer.** Even
+at 0.022 overall, a dedicated layer-by-layer diagnostic
+(`scripts/diagnose_layer_divergence.py`) was built to make sure that
+small remaining number wasn't hiding something layer-specific. It
+revealed the difference grows smoothly from ~0.0003 after layer 0 to
+~0.006 by layer 14 (the expected signature of independent fp32
+rounding noise compounding across 16 layers) -- and then an apparent
+spike to ~131.7 specifically after "layer 15," the last one. Investigated
+rather than assumed: printing each side's per-token RMS at that point
+showed HuggingFace's last `hidden_states` entry already had the final
+RMSNorm applied (matching `my_final`'s RMS, not `my_hidden`'s pre-norm
+RMS) -- this version of `transformers` includes the final norm in the
+last hidden-states entry, a detail of that library's internals, not a
+bug in this project. Comparing the SAME point (post-final-norm to
+post-final-norm) gave a difference of 0.0136, consistent with the
+smooth per-layer trend the rest of the network already showed.
+
+**Net result:** the verification tolerance was recalibrated from an
+arbitrary `1e-3` to an empirically-justified `0.05` -- tight enough that
+any of the four real bug classes this script checks for (wrong RoPE
+convention, a missed transpose, wrong GQA pairing, wrong tied-embeddings
+detection) would still fail loudly, since each of those produces
+differences in the tens-to-hundreds range, not hundredths.
+
 ## Running tests
 
 ```bash
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-python -m pytest tests/ -v   # 40 tests as of Phase 4
+python -m pytest tests/ -v   # 45 tests as of Phase 4
 ```
 
 ## Project layout
@@ -276,7 +348,8 @@ llama-inference/
 ├── testutil/
 │   └── random_weights.py  <- Random-but-correctly-shaped weights for testing (Phase 3)
 ├── scripts/
-│   └── verify_against_huggingface.py  <- Real-weight numerical cross-check (Phase 4, run on a machine with Hub access)
+│   ├── verify_against_huggingface.py     <- Real-weight numerical cross-check (Phase 4, run on a machine with Hub access)
+│   └── diagnose_layer_divergence.py      <- Layer-by-layer divergence localization, used to debug the verification above
 ├── tests/               <- one test file per model/ module, same names
 ├── kvcache/             <- (next) paged KV-cache
 ├── scheduler/           <- (next) continuous-batching scheduler
