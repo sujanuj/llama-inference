@@ -362,7 +362,7 @@ differences in the tens-to-hundreds range, not hundredths.
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-python -m pytest tests/ -v   # 64 tests as of Phase 6
+python -m pytest tests/ -v   # 77 tests as of Phase 7
 python benchmark/measure_naive_cache_memory.py  # real KV-cache memory measurements
 ```
 
@@ -392,8 +392,9 @@ llama-inference/
 │   ├── verify_against_huggingface.py     <- Real-weight numerical cross-check (Phase 4, run on a machine with Hub access)
 │   └── diagnose_layer_divergence.py      <- Layer-by-layer divergence localization, used to debug the verification above
 ├── tests/               <- one test file per model/ module, same names
-├── kvcache/             <- (next) paged KV-cache
-├── scheduler/           <- (next) continuous-batching scheduler
+
+│   ├── block_pool.py    <- shared block pool, allocation/free (Phase 7)
+│   └── scheduler.py     <- continuous-batching scheduler, eviction (Phase 7)
 ├── server/              <- (next) HTTP serving layer
 └── benchmark/           <- (next) throughput/latency benchmarks
 ```
@@ -431,3 +432,35 @@ MS Software Engineering — Arizona State University
       surfaces when a request's actual length is shorter than its pre-allocated
       max — e.g. a naive cache sized for max_seq_len=4096 serving a 512-token
       request wastes 3584 token-slots; the paged cache wastes at most 15.
+
+**Phase 7: Continuous-batching scheduler — done**
+
+- [x] `scheduler/block_pool.py` — a shared physical block pool and
+      `SequenceState` dataclass. The pool hands out block indices to
+      sequences on demand and returns them to the free list the moment a
+      sequence finishes — no block sits idle while another request is
+      waiting. `blocks_needed()` lets the scheduler check capacity before
+      committing to a decode step, so allocation failures are caught
+      cleanly rather than mid-step.
+- [x] `scheduler/scheduler.py` — a continuous-batching scheduler that
+      maintains a waiting queue and a running set. Each `step()` call:
+      (1) admits waiting requests that fit in the pool and prefills their
+      prompts; (2) checks that every running sequence has room for one
+      more token, evicting the longest-running sequence if the pool is
+      exhausted; (3) decodes one new token per running sequence; (4)
+      frees blocks and records results for any sequence that has hit
+      `max_new_tokens`. Requests are admitted as soon as memory is
+      available — not grouped into fixed-size batches — matching the
+      continuous-batching model from Orca (Yu et al., 2022) and vLLM.
+- [x] **Verified output-identical to direct `generate()`**: a single
+      request run through the scheduler produces a token-for-token
+      identical sequence to calling `generate()` directly — the scheduler
+      is a serving mechanism, not a different computation.
+- [x] **Block reuse verified**: a pool sized for one request at a time
+      correctly serves two sequential requests, confirming that finished
+      requests' blocks are actually freed and reusable — not just
+      logically released but still occupied.
+- [x] **Eviction under memory pressure verified**: with a pool too small
+      to sustain three concurrent sequences through full decode, the
+      scheduler evicts the longest-running sequence rather than
+      deadlocking, and at least one request completes.
