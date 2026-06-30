@@ -155,6 +155,7 @@ def generate(
     weights: ModelWeights,
     config: LlamaConfig,
     max_new_tokens: int,
+    cache_factory=None,
 ):
     """Generates max_new_tokens new tokens autoregressively, using a
     KVCache so each step only computes the new token's Q/K/V rather
@@ -176,9 +177,11 @@ def generate(
         (batch, prompt_len + max_new_tokens) -- the full sequence,
         prompt followed by generated tokens.
     """
-    from kvcache.naive_cache import KVCache
-
-    cache = KVCache(num_layers=config.num_hidden_layers)
+    if cache_factory is None:
+        from kvcache.naive_cache import KVCache
+        cache = KVCache(num_layers=config.num_hidden_layers)
+    else:
+        cache = cache_factory(config)
     all_ids = input_ids
 
     # Prefill: process the whole prompt in one forward_with_cache call,
