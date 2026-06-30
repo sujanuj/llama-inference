@@ -362,7 +362,7 @@ differences in the tens-to-hundreds range, not hundredths.
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-python -m pytest tests/ -v   # 77 tests as of Phase 7
+python -m pytest tests/ -v   # 88 tests as of Phase 8
 python benchmark/measure_naive_cache_memory.py  # real KV-cache memory measurements
 ```
 
@@ -464,3 +464,55 @@ MS Software Engineering — Arizona State University
       to sustain three concurrent sequences through full decode, the
       scheduler evicts the longest-running sequence rather than
       deadlocking, and at least one request completes.
+
+
+**Phase 8: HTTP inference server — done**
+
+- [x] `server/server.py` — a single-file HTTP inference server built on
+      Python's stdlib `http.server` (no Flask or FastAPI). Exposes two
+      endpoints: `POST /generate` accepts a JSON body with `token_ids`
+      and `max_new_tokens`, runs the request through the scheduler, and
+      returns the full token sequence; `GET /health` returns
+      `{"status": "ok"}` immediately. Explicitly single-threaded -- one
+      request at a time -- noted as a scope limit rather than glossed over.
+- [x] `server/client.py` — a stdlib-only test client for manual
+      end-to-end verification against a running server.
+- [x] **Verified output-identical to direct `generate()`**: the server
+      test re-creates the same weights with the same seed and confirms
+      the HTTP response matches `generate()` token-for-token.
+- [x] Input validation tested explicitly: missing fields, empty
+      `token_ids`, invalid JSON all return 400; unknown paths return 404.
+
+**Phase 9: Throughput/latency benchmark — done**
+
+- [x] `benchmark/throughput_latency.py` — measures latency (TTFT and
+      total generation time for a single request) and throughput (tokens
+      per second with N concurrent requests) at real Llama-3.2-1B
+      dimensions. Random weights are used so timing reflects tensor
+      shapes and compute, not weight values.
+
+**Benchmark results (Llama-3.2-1B dimensions, float32, CPU/Apple M5):**
+
+```
+Latency (single request)
+  prompt_len    max_new       TTFT      total      tok/s
+          32         16      1.40s      2.40s        6.7
+          64         32      783ms      4.19s        7.6
+         128         32      1.77s      3.84s        8.3
+         128         64      393ms      4.71s       13.6
+         256         64      600ms      4.89s       13.1
+
+Throughput (concurrent requests)
+  requests   prompt_len    max_new   finished        tok/s
+         1           64         32          1         12.5
+         4           64         32          4         11.4
+         8           64         32          8         12.3
+         4          128         32          4         10.9
+         8          128         32          8         11.7
+```
+
+Throughput stays flat (~11-12 tok/s) across 1, 4, and 8 concurrent
+requests -- the bottleneck on CPU is the forward pass itself, not
+scheduler or block-pool overhead. A CUDA device would give substantially
+higher throughput; the scheduler and block-pool mechanics are identical
+regardless of device.
