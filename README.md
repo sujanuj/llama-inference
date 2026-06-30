@@ -362,7 +362,7 @@ differences in the tens-to-hundreds range, not hundredths.
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-python -m pytest tests/ -v   # 54 tests as of Phase 5 part 1
+python -m pytest tests/ -v   # 64 tests as of Phase 6
 python benchmark/measure_naive_cache_memory.py  # real KV-cache memory measurements
 ```
 
@@ -383,9 +383,11 @@ llama-inference/
 ├── testutil/
 │   └── random_weights.py  <- Random-but-correctly-shaped weights for testing (Phase 3)
 ├── kvcache/
-│   └── naive_cache.py                    <- Naive per-request KV-cache (Phase 5 part 1)
+│   ├── naive_cache.py                    <- Naive per-request KV-cache (Phase 5 part 1)
+│   └── paged_cache.py                    <- Paged KV-cache, block-granularity allocation (Phase 6)
 ├── benchmark/
-│   └── measure_naive_cache_memory.py     <- Real memory baseline at Llama-3.2-1B dimensions
+│   ├── measure_naive_cache_memory.py     <- Real memory baseline at Llama-3.2-1B dimensions
+│   └── measure_paged_cache_memory.py     <- Naive vs paged side-by-side comparison (Phase 6)
 ├── scripts/
 │   ├── verify_against_huggingface.py     <- Real-weight numerical cross-check (Phase 4, run on a machine with Hub access)
 │   └── diagnose_layer_divergence.py      <- Layer-by-layer divergence localization, used to debug the verification above
@@ -400,3 +402,32 @@ llama-inference/
 
 **Sujan Uppalli Jayadevappa**
 MS Software Engineering — Arizona State University
+
+**Phase 6: Paged KV-cache — done**
+
+- [x] `kvcache/paged_cache.py` — a paged KV-cache that pre-allocates a
+      fixed pool of equal-sized blocks (block_size=16 tokens/block, matching
+      vLLM's default) and assigns them to sequences on demand via a
+      per-sequence block table. No tensor is ever reallocated or copied at
+      decode time — each append writes into the current tail block's
+      pre-allocated slot and spills into a new block only when the tail fills.
+- [x] **Gather step made explicit**: reading non-contiguous physical blocks
+      back into a contiguous `(batch, kv_heads, seq_len, head_dim)` view for
+      attention is the direct cost of paging — one `index_select` on the
+      pre-allocated pool per decode step, rather than the naive cache's
+      per-step `torch.cat` reallocation. Both costs are real; the tradeoff
+      is measured rather than assumed.
+- [x] **Verified output-identical to the naive cache**: `test_paged_cache.py`
+      checks raw tensor equality after single and multi-step appends (including
+      the cross-block-boundary case: appending 3+1+1+2 tokens with block_size=4
+      spans two blocks), then verifies that full autoregressive generation
+      through the paged cache produces a token-for-token identical sequence to
+      the naive cache across two prompt/length combinations.
+- [x] `benchmark/measure_paged_cache_memory.py` — runs the same
+      seq_len/batch_size grid as `measure_naive_cache_memory.py` and reports
+      both caches side by side. The 0.0% overhead is correct and honest: all
+      benchmark sequences are exact multiples of block_size=16, so there is no
+      partial tail block. The paged cache's fragmentation advantage only
+      surfaces when a request's actual length is shorter than its pre-allocated
+      max — e.g. a naive cache sized for max_seq_len=4096 serving a 512-token
+      request wastes 3584 token-slots; the paged cache wastes at most 15.
